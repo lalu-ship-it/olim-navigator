@@ -17,6 +17,10 @@ let globalSpend = { day: DAY(), usd: 0 };
 const MSG_CAP = Number(process.env.DAILY_MSG_CAP) || 30;
 const SPEND_CAP = Number(process.env.GLOBAL_DAILY_SPEND_USD) || 15;
 const COST_PER_MSG = 0.01; // rough Gemini-Flash estimate for the circuit breaker
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
+const MODEL_TIMEOUT_MS = Number(process.env.MODEL_TIMEOUT_MS) || 10_000;
+const CHAT_OUTPUT_TOKENS = Number(process.env.CHAT_OUTPUT_TOKENS) || 900;
+const DISCOVERY_OUTPUT_TOKENS = Number(process.env.DISCOVERY_OUTPUT_TOKENS) || 650;
 
 function checkCaps(id: string): "ok" | "user" | "global" {
   const today = DAY();
@@ -72,6 +76,24 @@ ${profileCtx}
 
 === GROUNDING ===
 ${grounding}`;
+}
+
+function discoveryGrounding(): string {
+  return `Fast discovery grounding for new immigrants to Israel:
+- Misrad HaKlita (משרד העלייה והקליטה) handles Teudat Oleh, absorption guidance, Sal Klita status, Ulpan referral, and the online personal area.
+- Sal Klita (סל קליטה) depends on immigrant status, family composition, and timing. Tell users to verify exact eligibility and payments in the Misrad HaKlita personal area.
+- Ulpan (אולפן) is a key time-sensitive Hebrew-learning benefit for many olim. The user should confirm the available track and registration window with Misrad HaKlita.
+- Health setup usually requires Bituach Leumi (ביטוח לאומי) and choosing a kupat cholim (קופת חולים). Missing activation can block services.
+- Municipal Arnona (ארנונה) discounts are local. The user must ask the municipality where they live; it is usually not automatic.
+- Foreign driver's license conversion (המרת רישיון נהיגה) is time-sensitive and belongs to the aliyah/license conversion path, not vehicle registration.
+- Families with children should check Bituach Leumi child allowance and Child Savings Plan (חיסכון לכל ילד), and school/municipal absorption support.
+- For refunds, customs, shipping, bank, apartment, car, legal, or medical-specific questions, ask a focused follow-up so the app can route to the right grounded guide.
+
+Discovery answer style:
+- Return 4-6 concrete "you may be missing this" bullets.
+- Add a short "what to do next" section.
+- Avoid exact money amounts unless present in the user-provided context.
+- Use deadlines only when they can be computed from the user's aliyah date or described safely as "check this window now".`;
 }
 
 type ModelResult = { answer: string; degraded?: boolean };
@@ -136,23 +158,46 @@ function fallbackDiscoveries(a: Answers, lang: Lang): string {
   return `${copy.intro}\n\n${lines.map((line) => `- ${line}`).join("\n")}`;
 }
 
-async function callGemini(system: string, text: string, lang: Lang, image?: { data: string; mime: string }) {
+async function callGemini(system: string, text: string, lang: Lang, image: { data: string; mime: string } | undefined, maxOutputTokens: number): Promise<ModelResult> {
   const key = process.env.GEMINI_API_KEY;
   if (!key) return { answer: stub(text) };
   const parts: any[] = [{ text }];
   if (image) parts.push({ inline_data: { mime_type: image.mime, data: image.data } });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
   try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${key}`, {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ system_instruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts }] }),
+      signal: controller.signal,
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: system }] },
+        contents: [{ role: "user", parts }],
+        generationConfig: { maxOutputTokens, temperature: 0.2 },
+      }),
     });
     const j = await r.json();
-    if (!r.ok || j?.error) return { answer: modelBusyMessage(lang, !!image), degraded: true };
+    if (!r.ok || j?.error) {
+      console.warn("olim_model_error", {
+        provider: "gemini",
+        model: GEMINI_MODEL,
+        status: r.status,
+        reason: j?.error?.status || j?.error?.message || "bad_response",
+      });
+      return { answer: modelBusyMessage(lang, !!image), degraded: true };
+    }
     const answer = j?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!answer) return { answer: modelBusyMessage(lang, !!image), degraded: true };
     return { answer };
-  } catch {
+  } catch (error) {
+    console.warn("olim_model_error", {
+      provider: "gemini",
+      model: GEMINI_MODEL,
+      status: "fetch_failed",
+      reason: error instanceof Error ? error.name : "unknown",
+    });
     return { answer: modelBusyMessage(lang, !!image), degraded: true };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -160,7 +205,7 @@ async function callGemini(system: string, text: string, lang: Lang, image?: { da
 // never break the app. Any failure here falls back to the Gemini path instead of erroring.
 async function callClaude(system: string, text: string, lang: Lang, image?: { data: string; mime: string }) {
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return callGemini(system, text, lang, image);
+  if (!key) return callGemini(system, text, lang, image, CHAT_OUTPUT_TOKENS);
   try {
     const content: any[] = [{ type: "text", text }];
     if (image) content.unshift({ type: "image", source: { type: "base64", media_type: image.mime, data: image.data } });
@@ -172,7 +217,7 @@ async function callClaude(system: string, text: string, lang: Lang, image?: { da
     const j = await r.json();
     if (j?.content?.[0]?.text) return { answer: j.content[0].text };
   } catch {}
-  return callGemini(system, text, lang, image);
+  return callGemini(system, text, lang, image, CHAT_OUTPUT_TOKENS);
 }
 
 // No API key yet → return a visible stub so the UI is fully testable.
@@ -187,6 +232,7 @@ const MAX_TEXT_LEN = 4000;
 const MAX_IMAGE_B64_LEN = 14_000_000;
 
 export async function POST(req: NextRequest) {
+  const startedAt = Date.now();
   const { text = "", lang = "en", image, mode, quiz } = await req.json();
   const safeLang = normalizeLang(lang);
 
@@ -211,14 +257,27 @@ export async function POST(req: NextRequest) {
   // Route grounding on the query, falling back to the quiz city/status for the discovery call.
   const routeKey = mode === "discover" ? `${a.employment} ${a.family} aliyah sal klita` : text;
 
-  const { skill, content } = groundFor(routeKey);
+  const { skill, content } = mode === "discover"
+    ? { skill: "fast-discovery", content: discoveryGrounding() }
+    : groundFor(routeKey);
   const system = systemPrompt(content, safeLang, profileContext(a));
+  const modelStartedAt = Date.now();
   const modelResult: ModelResult = needsClaude(userText)
     ? await callClaude(system, userText, safeLang, image)
-    : await callGemini(system, userText, safeLang, image);
+    : await callGemini(system, userText, safeLang, image, mode === "discover" ? DISCOVERY_OUTPUT_TOKENS : CHAT_OUTPUT_TOKENS);
   const answer = mode === "discover" && modelResult.degraded
     ? fallbackDiscoveries(a, safeLang)
     : modelResult.answer;
+
+  console.info("olim_api_timing", {
+    mode: mode || "chat",
+    skill,
+    model: needsClaude(userText) ? "claude-or-gemini-fallback" : GEMINI_MODEL,
+    groundedChars: content.length,
+    modelMs: Date.now() - modelStartedAt,
+    totalMs: Date.now() - startedAt,
+    degraded: !!modelResult.degraded,
+  });
 
   const res = NextResponse.json({ answer, skill });
   if (setCookie) {
