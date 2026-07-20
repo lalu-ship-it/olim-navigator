@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import { t, LANGS, type Lang } from "@/lib/i18n";
 import { QUESTIONS, type Answers } from "@/lib/quiz";
 import { computeDeadlines, daysUntil, type Deadline } from "@/lib/timeline";
+import { instantDiscoveries } from "@/lib/discoveries";
 
 type Msg = { role: "user" | "bot"; text: string };
 // FR-C1 soft client-side counter — a pre-check to save a round-trip; the server's
@@ -42,6 +43,7 @@ export default function Home() {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [refiningDiscoveries, setRefiningDiscoveries] = useState(false);
   const [capped, setCapped] = useState<"" | "user" | "global">("");
   const fileRef = useRef<HTMLInputElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
@@ -84,25 +86,36 @@ export default function Home() {
   const inQuiz = phase === "quiz";
   const onResults = phase === "discovering";
 
-  async function api(body: object) {
+  async function api(body: object, options: { quiet?: boolean } = {}) {
     if (bumpDailyCount() > CLIENT_CAP) { setCapped("user"); return null; }
-    setBusy(true);
+    if (!options.quiet) setBusy(true);
     try {
       const r = await fetch("/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       const j = await r.json();
       if (j.capped) { setCapped(j.capped); return null; }
       return j.answer as string;
-    } finally { setBusy(false); }
+    } finally {
+      if (!options.quiet) setBusy(false);
+    }
   }
 
   async function finishQuiz(a: Answers) {
     const profile = { ...a, lang };
-    setPhase("discovering");
-    const ans = await api({ text: "quiz-discoveries", lang, quiz: profile, mode: "discover" });
-    const text = ans || "";
-    setDiscoveries(text);
-    localStorage.setItem("olim_profile", JSON.stringify({ answers: profile, discoveries: text }));
+    const instant = instantDiscoveries(profile, lang);
+    setDiscoveries(instant);
+    localStorage.setItem("olim_profile", JSON.stringify({ answers: profile, discoveries: instant }));
     setPhase("chat");
+    setRefiningDiscoveries(true);
+
+    try {
+      const ans = await api({ text: "quiz-discoveries", lang, quiz: profile, mode: "discover" }, { quiet: true });
+      if (ans) {
+        setDiscoveries(ans);
+        localStorage.setItem("olim_profile", JSON.stringify({ answers: profile, discoveries: ans }));
+      }
+    } finally {
+      setRefiningDiscoveries(false);
+    }
   }
 
   async function send(text: string, image?: { data: string; mime: string }) {
@@ -199,6 +212,7 @@ export default function Home() {
               <div className="flex items-center gap-2 border-b border-amber-100 bg-gradient-to-r from-amber-50 to-orange-50/60 px-5 py-3">
                 <span className="text-xl">🎁</span>
                 <h2 className="font-display text-lg font-semibold">{L.discoveries}</h2>
+                {refiningDiscoveries && <span className="ml-auto"><ThinkingDots /></span>}
               </div>
               <div className="p-5 text-sm leading-relaxed">
                 <Prose text={discoveries} />
