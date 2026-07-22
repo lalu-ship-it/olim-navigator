@@ -6,7 +6,9 @@ import { QUESTIONS, type Answers } from "@/lib/quiz";
 import { computeDeadlines, daysUntil, type Deadline } from "@/lib/timeline";
 import { instantDiscoveries } from "@/lib/discoveries";
 
-type Msg = { role: "user" | "bot"; text: string };
+type FeedbackRating = "helpful" | "not-helpful" | "too-slow";
+type Msg = { role: "user" | "bot"; text: string; id?: string; skill?: string; feedback?: FeedbackRating };
+type ApiResult = { answer: string; skill?: string };
 // FR-C1 soft client-side counter — a pre-check to save a round-trip; the server's
 // DAILY_MSG_CAP is authoritative. Keep NEXT_PUBLIC_DAILY_MSG_CAP equal to DAILY_MSG_CAP
 // (Next.js can't share one env var between server and client), or this silently drifts.
@@ -26,6 +28,17 @@ const OPTION_EMOJI: Record<string, string> = {
   single: "🙋", couple: "💑", family: "👨‍👩‍👧",
   employed: "💼", "job-seeking": "🔍", student: "🎓", "self-employed": "🚀",
   yes: "✅", no: "➖", some: "🔹",
+};
+
+const GUIDE_LABELS: Record<string, string> = {
+  "fast-discovery": "Fast discovery",
+  "israeli-aliyah-navigator": "Aliyah Navigator",
+  "israeli-bituach-leumi": "Bituach Leumi",
+  "israeli-hmo-navigator": "Health Funds",
+  "israeli-apartment-hunting": "Apartment Hunting",
+  "israeli-vehicle-manager": "Vehicle Guide",
+  "israeli-bank-connector": "Banking Guide",
+  "israeli-aliyah-customs-shipment-planner": "Customs & Shipping",
 };
 
 // Some questions only apply given earlier answers (e.g. spouse/kids questions only for
@@ -93,7 +106,7 @@ export default function Home() {
       const r = await fetch("/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       const j = await r.json();
       if (j.capped) { setCapped(j.capped); return null; }
-      return j.answer as string;
+      return j as ApiResult;
     } finally {
       if (!options.quiet) setBusy(false);
     }
@@ -109,9 +122,9 @@ export default function Home() {
 
     try {
       const ans = await api({ text: "quiz-discoveries", lang, quiz: profile, mode: "discover" }, { quiet: true });
-      if (ans) {
-        setDiscoveries(ans);
-        localStorage.setItem("olim_profile", JSON.stringify({ answers: profile, discoveries: ans }));
+      if (ans?.answer) {
+        setDiscoveries(ans.answer);
+        localStorage.setItem("olim_profile", JSON.stringify({ answers: profile, discoveries: ans.answer }));
       }
     } finally {
       setRefiningDiscoveries(false);
@@ -123,7 +136,23 @@ export default function Home() {
     setMsgs((m) => [...m, { role: "user", text: image ? "🖼️ " + (text || L.uploadLetter) : text }]);
     setInput("");
     const ans = await api({ text, lang, image, quiz: { ...answers, lang } });
-    if (ans) setMsgs((m) => [...m, { role: "bot", text: ans }]);
+    if (ans?.answer) {
+      const id = typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      setMsgs((m) => [...m, { role: "bot", text: ans.answer, id, skill: ans.skill }]);
+    }
+  }
+
+  async function sendFeedback(answerId: string, rating: FeedbackRating, skill?: string) {
+    setMsgs((prev) => prev.map((m) => m.id === answerId ? { ...m, feedback: rating } : m));
+    try {
+      await fetch("/api/feedback", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ answerId, rating, skill, lang }),
+      });
+    } catch {}
   }
 
   function onFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -243,13 +272,23 @@ export default function Home() {
                 {m.role === "bot" && (
                   <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-sm shadow-md shadow-blue-900/20">🧭</div>
                 )}
-                <span className={`inline-block max-w-[82%] px-4 py-2.5 text-sm leading-relaxed ${
-                  m.role === "user"
-                    ? "whitespace-pre-wrap rounded-2xl rounded-br-md bg-[var(--accent)] text-white shadow-md shadow-blue-900/20"
-                    : "card-soft rounded-2xl rounded-bl-md"
-                }`}>
-                  {m.role === "bot" ? <Prose text={m.text} /> : m.text}
-                </span>
+                <div className={`flex max-w-[82%] flex-col ${m.role === "user" ? "items-end" : "items-start"}`}>
+                  <span className={`inline-block px-4 py-2.5 text-sm leading-relaxed ${
+                    m.role === "user"
+                      ? "whitespace-pre-wrap rounded-2xl rounded-br-md bg-[var(--accent)] text-white shadow-md shadow-blue-900/20"
+                      : "card-soft rounded-2xl rounded-bl-md"
+                  }`}>
+                    {m.role === "bot" ? <Prose text={m.text} /> : m.text}
+                  </span>
+                  {m.role === "bot" && m.id && (
+                    <FeedbackBar
+                      lang={lang}
+                      skill={m.skill}
+                      rating={m.feedback}
+                      onRate={(rating) => sendFeedback(m.id!, rating, m.skill)}
+                    />
+                  )}
+                </div>
               </div>
             ))}
             {busy && (
@@ -319,6 +358,31 @@ function QuizStep({ index, lang, questions, onAnswer, onSkip }: { index: number;
       )}
       <button onClick={onSkip} className="mt-5 text-xs text-slate-400 underline-offset-2 transition-colors hover:text-slate-600 hover:underline">{t[lang].skip}</button>
     </section>
+  );
+}
+
+function FeedbackBar({ lang, skill, rating, onRate }: {
+  lang: Lang; skill?: string; rating?: FeedbackRating; onRate: (rating: FeedbackRating) => void;
+}) {
+  const L = t[lang];
+  const guide = GUIDE_LABELS[skill || ""] || skill || "Olim Navigator";
+  if (rating) {
+    return (
+      <div className="mt-1.5 flex flex-wrap items-center gap-2 px-1 text-[11px] text-slate-400">
+        <span>{L.groundedIn}: {guide}</span>
+        <span>·</span>
+        <span>{L.thanksFeedback}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 px-1 text-[11px] text-slate-400">
+      <span className="mr-1">{L.groundedIn}: {guide}</span>
+      <button onClick={() => onRate("helpful")} className="rounded-full border border-slate-200 bg-white px-2 py-0.5 transition-colors hover:border-emerald-200 hover:text-emerald-700">{L.helpful}</button>
+      <button onClick={() => onRate("not-helpful")} className="rounded-full border border-slate-200 bg-white px-2 py-0.5 transition-colors hover:border-rose-200 hover:text-rose-700">{L.notHelpful}</button>
+      <button onClick={() => onRate("too-slow")} className="rounded-full border border-slate-200 bg-white px-2 py-0.5 transition-colors hover:border-amber-200 hover:text-amber-700">{L.tooSlow}</button>
+    </div>
   );
 }
 
